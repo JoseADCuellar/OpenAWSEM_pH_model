@@ -13,6 +13,13 @@ import importlib.util
 
 from openawsem import *
 from openawsem.helperFunctions.myFunctions import *
+###change###
+from openmm.app import PDBFile, PDBReporter
+from openmm import Vec3
+import json
+from openawsem.helperFunctions.Montecarlo import *
+
+###change###
 
 # simulation_platform = "CPU"  # OpenCL, CUDA, CPU, or Reference
 # simulation_platform = "OpenCL"
@@ -150,13 +157,84 @@ def run(args):
     simulation.reporters.append(DCDReporter(os.path.join(toPath, "movie.dcd"), reportInterval=reporter_frequency, append=True))  # output PDBs of simulated structures
     # simulation.reporters.append(DCDReporter(os.path.join(args.to, "movie.dcd"), 1))  # output PDBs of simulated structures
     # simulation.reporters.append(PDBReporter(os.path.join(args.to, "movie.pdb"), 1))  # output PDBs of simulated structures
-    simulation.reporters.append(CheckpointReporter(os.path.join(toPath, checkpoint_file), checkpoint_reporter_frequency))  # save progress during the simulation
-
+    #####Change#####
+    #checkpoint_file = os.path.join(toPath, "checkpnt.chk")
+    #simulation.reporters.append(CheckpointReporter(checkpoint_file, checkpoint_reporter_frequency))
+    #####Change#####
+    #simulation.reporters.append(CheckpointReporter(os.path.join(toPath, checkpoint_file), checkpoint_reporter_frequency))  # save progress during the simulation
     print("Simulation Starts")
     start_time = time.time()
+#####Change####       
+    interrupt_frequency = args.interruptFrequency
+    cb_atoms_matrix = id_and_residues_df_oasistem(oa)#crea un df con los id y numero de residuo que me da el obejto oa (sistema.topology)
+    charged_residues = procesador_de_archivo_con_residuos_cargados('charge.txt')#lee el archivo y los pasa a una lista de tuplas (Residuo,carga)
+    num_bonds = myForces[-1].getNumBonds()
+    #print(num_bonds)
+    last_force = myForces[-1]
+    atom_list = list(oa.pdb.topology.atoms())
+    seq = read_fasta("crystal_structure.fasta")
+    
+    Hawsem_state=[]
+    # Antes de empezar la simulacion, se abre el archivo en modo 'write' para crear/limpiar el archivo output
+    with open('Hawsem.state', 'w') as f:
+        pass    
+    #generar los argumentos para usarlo y crear asi la lista de ph, Osea si pongo de ph 1 a 14 e intervalo 0.5 me haga una lista de 1 a 15 con 0.5 entre cada uno
+    ph_values = list(range(1, 15))
+    steps_per_ph = 10000
 
     if args.simulation_mode == 0:
-        simulation.step(int(args.steps))
+        ph_index = 0
+        total_steps = 0
+
+        while total_steps < int(args.steps):
+            # Calcular el número de pasos restantes para el próximo cambio de pH
+            steps_until_ph_change = min(steps_per_ph, int(args.steps) - total_steps)
+    
+            for step in range(0, steps_until_ph_change, interrupt_frequency):
+                remaining_steps = min(interrupt_frequency, steps_until_ph_change - step)
+                simulation.step(remaining_steps)
+                total_steps += remaining_steps
+    
+                # Obtener las posiciones actuales de los átomos
+                state = simulation.context.getState(getPositions=True)
+                positions = state.getPositions()
+    
+                cb_positions_df = constructor_df_de_posiciones_de_CB(cb_atoms_matrix, positions) #loop for para iterar sobre cb_atom_matrix y obtener las posiciones de cada CB. Me devuelve un df ['Residue_Number', 'Atom_Index', 'X', 'Y', 'Z']
+                
+                enlaces_matrix = constructor_df_de_los_objetos_force(last_force, num_bonds, atom_list, oa) #accede al objeto force de Debye Huckel y a sus parametros para armar un df ['bond_index', 'seq_i', 'seq_j', 'carga_i', 'carga_j'] usa un loop for num_bonds
+                
+                pH = ph_values[ph_index]
+                
+                charged_residues, bond_matrix_df = Montecarlo(pH, charged_residues, cb_positions_df, seq, enlaces_matrix)
+
+                for _, row in bond_matrix_df.iterrows():
+                    bond_index = int(row['bond_index'])
+                    new_charge_i = row['carga_i']
+                    new_charge_j = row['carga_j']
+                    bond_parameters = last_force.getBondParameters(bond_index)
+                    atom_index_i, atom_index_j, _ = bond_parameters
+                    last_force.setBondParameters(bond_index, atom_index_i, atom_index_j, (new_charge_i, new_charge_j))
+
+                last_force.updateParametersInContext(simulation.context)
+
+            # Guardar enlaces_matrix en un archivo CSV
+            #enlaces_matrix.to_csv('enlaces_matrix.csv', index=False)
+            
+            # Guardar el estado de charged_residues en Hawsem.state
+                if total_steps % reporter_frequency == 0:
+                    Hawsem_state.append(json.dumps(charged_residues) + str(pH))#+ str(step)) puedo borrar el if y guardar cada cambio pero es mejor asi, para que sea igual al reporter_frecuency que lo defino en los argumentos
+                #with open('Hawsem.state', 'a') as f:
+                #    f.write(json.dumps(charged_residues) + str(pH) + "\n")
+
+        # Actualizar el índice de pH después de cada 1000 pasos
+            ph_index = (ph_index + 1) % len(ph_values)
+            
+        with open('Hawsem.state', 'w') as f:
+            for state in Hawsem_state:
+                f.write(state + "\n")
+
+####Change####
+
     elif args.simulation_mode == 1:
         deltaT = (Tend - Tstart) / snapShotCount
         for i in range(snapShotCount):
@@ -229,8 +307,9 @@ def main():
     parser.add_argument("-r", "--reportFrequency", type=int, default=-1, help="default value step/400")
     parser.add_argument("--fromOpenMMPDB", action="store_true", default=False)
     parser.add_argument("--fasta", type=str, default="crystal_structure.fasta")
-    parser.add_argument("--timeStep", type=int, default=2)
+    parser.add_argument("--timeStep", type=float, default=2)
     parser.add_argument("--includeLigands", action="store_true", default=False)
+    parser.add_argument("--interruptFrequency", type=int, default=5, help="Frequency of interruptions during simulation")
     args = parser.parse_args()
 
 
